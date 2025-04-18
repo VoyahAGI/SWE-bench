@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
-"""This python script is designed to run inference on a dataset using either the OpenAI or Anthropic API, depending on the model specified.
-It sorts instances by length and continually writes the outputs to a specified file, so that the script can be stopped and restarted without losing progress.
-"""
+"""API推理脚本，支持OpenAI和Anthropic模型"""
 
 import json
 import os
@@ -14,6 +12,8 @@ from tqdm.auto import tqdm
 import numpy as np
 import tiktoken
 import openai
+from openai import OpenAI, AzureOpenAI
+from transformers import AutoTokenizer
 from anthropic import HUMAN_PROMPT, AI_PROMPT, Anthropic
 from tenacity import (
     retry,
@@ -25,10 +25,12 @@ from swebench.inference.make_datasets.utils import extract_diff
 from argparse import ArgumentParser
 import logging
 
+# 日志配置
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 dotenv.load_dotenv()
 
+# 模型配置常量
 MODEL_LIMITS = {
     "claude-instant-1": 100_000,
     "claude-2": 100_000,
@@ -42,6 +44,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    'checkpoint-4070-merged-8b': 200_000,
 }
 
 # The cost per token for each model input.
@@ -61,6 +64,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    'checkpoint-4070-merged-8b': 0.0000015,
 }
 
 # The cost per token for each model output.
@@ -80,6 +84,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    'checkpoint-4070-merged-8b': 0.000002,
 }
 
 # used for azure
@@ -89,427 +94,343 @@ ENGINES = {
     "gpt-4-32k-0613": "gpt-4-32k",
 }
 
-
 def calc_cost(model_name, input_tokens, output_tokens):
-    """
-    Calculates the cost of a response from the openai API.
-
-    Args:
-    response (openai.ChatCompletion): The response from the API.
-
-    Returns:
-    float: The cost of the response.
-    """
+    """计算API调用成本"""
     cost = (
-        MODEL_COST_PER_INPUT[model_name] * input_tokens
-        + MODEL_COST_PER_OUTPUT[model_name] * output_tokens
+        MODEL_COST_PER_INPUT.get(model_name, 0) * input_tokens
+        + MODEL_COST_PER_OUTPUT.get(model_name, 0) * output_tokens
     )
-    logger.info(
-        f"input_tokens={input_tokens}, output_tokens={output_tokens}, cost={cost:.2f}"
-    )
+    logger.info(f"Tokens: {input_tokens} in, {output_tokens} out | Cost: ${cost:.5f}")
     return cost
 
-
 @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
-def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
-    """
-    Calls the openai API to generate completions for the given inputs.
-
-    Args:
-    model_name_or_path (str): The name or path of the model to use.
-    inputs (str): The inputs to generate completions for.
-    use_azure (bool): Whether to use the azure API.
-    temperature (float): The temperature to use.
-    top_p (float): The top_p to use.
-    **model_args (dict): A dictionary of model arguments.
-    """
-    system_messages = inputs.split("\n", 1)[0]
-    user_message = inputs.split("\n", 1)[1]
+def call_chat(client, model_name, messages, temperature=0.7, top_p=0.95, **kwargs):
+    """通用OpenAI风格API调用"""
     try:
-        if use_azure:
-            response = openai.chat.completions.create(
-                engine=ENGINES[model_name_or_path] if use_azure else None,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
-            )
-        else:
-            response = openai.chat.completions.create(
-                model=model_name_or_path,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
-            )
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            **kwargs
+        )
+        
+        # 计算成本
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
-        cost = calc_cost(response.model, input_tokens, output_tokens)
+        cost = calc_cost(model_name, input_tokens, output_tokens)
+        
         return response, cost
-    except openai.BadRequestError as e:
-        if e.code == "context_length_exceeded":
-            print("Context length exceeded")
-            return None
-        raise e
+    
+    except openai.APIConnectionError as e:
+        logger.error(f"连接错误: {e.__cause__}")
+        raise
+    except openai.RateLimitError as e:
+        logger.warning("速率限制，等待重试...")
+        time.sleep(30)
+        raise
+    except openai.APIStatusError as e:
+        logger.error(f"API错误: {e.status_code} {e.message}")
+        raise
 
-
-def gpt_tokenize(string: str, encoding) -> int:
-    """Returns the number of tokens in a text string."""
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
-
-
-def claude_tokenize(string: str, api) -> int:
-    """Returns the number of tokens in a text string."""
-    num_tokens = api.count_tokens(string)
-    return num_tokens
-
+def create_openai_client(model_args):
+    """创建OpenAI客户端实例"""
+    use_azure = model_args.pop("use_azure", False)
+    api_base = model_args.pop("api_base", None)
+    api_key = os.environ.get("OPENAI_API_KEY", "EMPTY")  # 虚拟密钥兼容本地API
+    
+    if use_azure:
+        return AzureOpenAI(
+            api_key=api_key,
+            api_version=model_args.pop("api_version", "2023-05-15"),
+            azure_endpoint=api_base or "https://pnlpopenai3.openai.azure.com/"
+        )
+    else:
+        return OpenAI(
+            api_key=api_key,
+            base_url=api_base
+        )
 
 def openai_inference(
     test_dataset,
-    model_name_or_path,
+    model_name,
     output_file,
     model_args,
     existing_ids,
     max_cost,
 ):
-    """
-    Runs inference on a dataset using the openai API.
-
-    Args:
-    test_dataset (datasets.Dataset): The dataset to run inference on.
-    model_name_or_path (str): The name or path of the model to use.
-    output_file (str): The path to the output file.
-    model_args (dict): A dictionary of model arguments.
-    existing_ids (set): A set of ids that have already been processed.
-    max_cost (float): The maximum cost to spend on inference.
-    """
-    encoding = tiktoken.encoding_for_model(model_name_or_path)
+    """OpenAI风格API推理主流程"""
+    # 初始化客户端
+    client = create_openai_client(model_args)
+    
+    # 加载分词器
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            "/home/voyah/Workspace/zhl/data/tokenizer", 
+            use_fast=True
+        )
+    except Exception as e:
+        logger.warning(f"无法加载分词器: {e}, 使用tiktoken")
+        tokenizer = tiktoken.encoding_for_model(model_name)
+    
+    # 数据集过滤
     test_dataset = test_dataset.filter(
-        lambda x: gpt_tokenize(x["text"], encoding) <= MODEL_LIMITS[model_name_or_path],
-        desc="Filtering",
+        lambda x: len(tokenizer.encode(x["text"])) <= MODEL_LIMITS[model_name],
+        desc="过滤超长上下文",
         load_from_cache_file=False,
     )
-    openai_key = os.environ.get("OPENAI_API_KEY", None)
-    if openai_key is None:
-        raise ValueError(
-            "Must provide an api key. Expected in OPENAI_API_KEY environment variable."
-        )
-    openai.api_key = openai_key
-    print(f"Using OpenAI key {'*' * max(0, len(openai_key) - 5) + openai_key[-5:]}")
-    use_azure = model_args.pop("use_azure", False)
-    if use_azure:
-        openai.api_type = "azure"
-        openai.api_base = "https://pnlpopenai3.openai.azure.com/"
-        openai.api_version = "2023-05-15"
-    temperature = model_args.pop("temperature", 0.2)
+    
+    # 推理参数
+    temperature = model_args.pop("temperature", 0.7)
     top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
-    print(f"Using temperature={temperature}, top_p={top_p}")
-    basic_args = {
-        "model_name_or_path": model_name_or_path,
-    }
+    logger.info(f"推理参数: temperature={temperature}, top_p={top_p}")
+
     total_cost = 0
-    print(f"Filtered to {len(test_dataset)} instances")
     with open(output_file, "a+") as f:
-        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
+        for datum in tqdm(test_dataset, desc=f"推理进度 {model_name}"):
             instance_id = datum["instance_id"]
             if instance_id in existing_ids:
                 continue
-            output_dict = {"instance_id": instance_id}
-            output_dict.update(basic_args)
-            output_dict["text"] = f"{datum['text']}\n\n"
-            response, cost = call_chat(
-                output_dict["model_name_or_path"],
-                output_dict["text"],
-                use_azure,
-                temperature,
-                top_p,
-            )
-            completion = response.choices[0].message.content
+            
+            # 构造消息
+            system_msg, _, user_msg = datum["text"].partition("\n")
+            messages = [
+                {"role": "system", "content": system_msg.strip()},
+                {"role": "user", "content": user_msg.strip()},
+            ]
+            
+            try:
+                response, cost = call_chat(
+                    client=client,
+                    model_name=model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **model_args
+                )
+            except Exception as e:
+                logger.error(f"实例 {instance_id} 处理失败: {str(e)}")
+                continue
+            
             total_cost += cost
-            print(f"Total Cost: {total_cost:.2f}")
-            output_dict["full_output"] = completion
-            output_dict["model_patch"] = extract_diff(completion)
-            print(json.dumps(output_dict), file=f, flush=True)
-            if max_cost is not None and total_cost >= max_cost:
-                print(f"Reached max cost {max_cost}, exiting")
+            completion = response.choices[0].message.content
+            
+            # 保存结果
+            output = {
+                "instance_id": instance_id,
+                "model": model_name,
+                "full_output": completion,
+                "model_patch": extract_diff(completion),
+                "cost": cost,
+                "timestamp": time.time(),
+            }
+            f.write(json.dumps(output) + "\n")
+            f.flush()
+            
+            logger.info(f"累计成本: ${total_cost:.5f}")
+            if max_cost and total_cost >= max_cost:
+                logger.warning(f"达到最大成本限制 ${max_cost}, 停止推理")
                 break
 
+def create_anthropic_client(model_args):
+    """创建Anthropic客户端实例"""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY环境变量未设置")
+    
+    return Anthropic(api_key=api_key)
 
-@retry(wait=wait_random_exponential(min=60, max=600), stop=stop_after_attempt(6))
-def call_anthropic(
-    inputs, anthropic, model_name_or_path, temperature, top_p, **model_args
-):
-    """
-    Calls the anthropic API to generate completions for the given inputs.
-
-    Args:
-    inputs (str): The inputs to generate completions for.
-    anthropic (Anthropic): The anthropic API object.
-    model_name_or_path (str): The name or path of the model to use.
-    temperature (float): The temperature to use.
-    top_p (float): The top_p to use.
-    model_args (dict): A dictionary of model arguments.
-    """
+@retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(5))
+def call_anthropic_api(client, model_name, prompt, temperature=0.2, top_p=0.95, **kwargs):
+    """统一Anthropic API调用"""
     try:
-        completion = anthropic.completions.create(
-            model=model_name_or_path,
-            max_tokens_to_sample=6000,
-            prompt=inputs,
-            temperature=temperature,
-            top_p=top_p,
-            **model_args,
-        )
-        response = completion.completion
-        input_tokens = anthropic.count_tokens(inputs)
-        output_tokens = anthropic.count_tokens(response)
-        cost = calc_cost(model_name_or_path, input_tokens, output_tokens)
-        return completion, cost
+        # Claude 3使用messages接口
+        if "claude-3" in model_name:
+            system_prompt, _, user_message = prompt.partition("\n")
+            messages = [{"role": "user", "content": user_message.strip()}]
+            
+            response = client.messages.create(
+                model=model_name,
+                messages=messages,
+                system=system_prompt.strip(),
+                max_tokens=4096,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs
+            )
+            
+            input_tokens = response.usage.input_tokens
+            output_tokens = response.usage.output_tokens
+            content = response.content[0].text
+            
+        else:  # Claude 2及以下版本
+            response = client.completions.create(
+                model=model_name,
+                prompt=prompt,
+                max_tokens_to_sample=4096,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs
+            )
+            
+            input_tokens = client.count_tokens(prompt)
+            output_tokens = client.count_tokens(response.completion)
+            content = response.completion
+        
+        cost = calc_cost(model_name, input_tokens, output_tokens)
+        return content, cost
+    
     except Exception as e:
-        logger.error(e)
-        logger.error(f"Inputs: {inputs}")
-        traceback.print_exc()
-        time.sleep(20)
-        return None
-
-
-@retry(wait=wait_random_exponential(min=60, max=600), stop=stop_after_attempt(6))
-def call_anthropic_v2(
-    inputs, anthropic, model_name_or_path, temperature, top_p, **model_args
-):
-    """
-    Calls the anthropic API to generate completions for the given inputs.
-
-    Args:
-    inputs list(str): The inputs to generate completions for.
-    anthropic (Anthropic): The anthropic API object.
-    model_name_or_path (str): The name or path of the model to use.
-    temperature (float): The temperature to use.
-    top_p (float): The top_p to use.
-    model_args (dict): A dictionary of model arguments.
-    """
-    system_messages = inputs.split("\n", 1)[0]
-    user_message = inputs.split("\n", 1)[1]
-    try:
-        messages = [
-            {"role": "user", "content": user_message},
-        ]
-        response = anthropic.messages.create(
-            messages=messages,
-            max_tokens=4096,
-            model=model_name_or_path,
-            temperature=temperature,
-            top_p=top_p,
-            system=system_messages,
-        )
-        input_tokens = response.usage.input_tokens
-        output_tokens = response.usage.output_tokens
-        cost = calc_cost(response.model, input_tokens, output_tokens)
-        return response, cost
-    except Exception as e:
-        logger.error(e)
-        logger.error(f"Inputs: {inputs}")
-        traceback.print_exc()
-        time.sleep(20)
-        return None
-
+        logger.error(f"API调用失败: {str(e)}")
+        if hasattr(e, "status_code"):
+            if e.status_code == 429:  # 速率限制
+                logger.warning("速率限制，等待10秒后重试...")
+                time.sleep(10)
+            elif 500 <= e.status_code < 600:  # 服务器错误
+                logger.warning(f"服务器错误 ({e.status_code}), 等待30秒...")
+                time.sleep(30)
+        raise
 
 def anthropic_inference(
     test_dataset,
-    model_name_or_path,
+    model_name,
     output_file,
     model_args,
     existing_ids,
     max_cost,
 ):
-    """
-    Runs inference on a dataset using the anthropic API.
-
-    Args:
-    test_dataset (datasets.Dataset): The dataset to run inference on.
-    model_name_or_path (str): The name or path of the model to use.
-    output_file (str): The path to the output file.
-    model_args (dict): A dictionary of model arguments.
-    existing_ids (set): A set of ids that have already been processed.
-    max_cost (float): The maximum cost to spend on inference.
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", None)
-    if api_key is None:
-        raise ValueError(
-            "Must provide an api key. Expected in ANTHROPIC_API_KEY environment variable."
-        )
-    print(f"Using Anthropic key {'*' * max(0, len(api_key) - 5) + api_key[-5:]}")
-    anthropic = Anthropic(api_key=api_key)
-    test_dataset = test_dataset.filter(
-        lambda x: claude_tokenize(x["text"], anthropic)
-        <= MODEL_LIMITS[model_name_or_path],
-        desc="Filtering",
+    """Anthropic模型推理主流程"""
+    # 初始化客户端
+    client = create_anthropic_client(model_args)
+    
+    # 过滤数据集
+    test_dataset = test_dataset.map(
+        lambda x: {"token_count": client.count_tokens(x["text"])},
+        desc="计算Token数量",
+        load_from_cache_file=False,
+    ).filter(
+        lambda x: x["token_count"] <= MODEL_LIMITS[model_name],
+        desc="过滤超长上下文",
         load_from_cache_file=False,
     )
+    
+    # 推理参数
     temperature = model_args.pop("temperature", 0.2)
     top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
-    print(f"Using temperature={temperature}, top_p={top_p}")
-    basic_args = {
-        "model_name_or_path": model_name_or_path,
-    }
+    logger.info(f"推理参数: temperature={temperature}, top_p={top_p}")
+
     total_cost = 0
-    print(f"Filtered to {len(test_dataset)} instances")
-    if "claude-3" in model_name_or_path.lower():
-        call_api = call_anthropic_v2
-    else:
-        call_api = call_anthropic
     with open(output_file, "a+") as f:
-        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
+        for datum in tqdm(test_dataset, desc=f"推理进度 {model_name}"):
             instance_id = datum["instance_id"]
             if instance_id in existing_ids:
                 continue
-            output_dict = {"instance_id": instance_id}
-            output_dict.update(basic_args)
-            if "claude-3" in model_name_or_path.lower():
-                output_dict["text_inputs"] = f"{datum['text']}\n"
+            
+            # 构造Prompt
+            if "claude-3" in model_name:
+                prompt = datum["text"]
             else:
-                output_dict["text_inputs"] = (
-                    f"{HUMAN_PROMPT} {datum['text']}\n\n{AI_PROMPT}"
-                )
+                prompt = f"{HUMAN_PROMPT} {datum['text']}\n\n{AI_PROMPT}"
+            
             try:
-                completion, cost = call_api(
-                    output_dict["text_inputs"],
-                    anthropic,
-                    model_name_or_path,
-                    temperature,
-                    top_p,
-                    **model_args,
+                completion, cost = call_anthropic_api(
+                    client=client,
+                    model_name=model_name,
+                    prompt=prompt,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **model_args
                 )
             except Exception as e:
-                logger.error(e)
-                traceback.print_exc()
+                logger.error(f"实例 {instance_id} 处理失败: {str(e)}")
                 continue
+            
             total_cost += cost
-            print(f"Total Cost: {total_cost:.2f}")
-            if "claude-3" in model_name_or_path.lower():
-                output_dict["full_output"] = completion.content[0].text
-            else:
-                output_dict["full_output"] = completion.completion
-            output_dict["model_patch"] = extract_diff(output_dict["full_output"])
-            print(json.dumps(output_dict), file=f, flush=True)
-            if max_cost is not None and total_cost >= max_cost:
-                print(f"Reached max cost {max_cost}, exiting")
+            output = {
+                "instance_id": instance_id,
+                "model": model_name,
+                "full_output": completion,
+                "model_patch": extract_diff(completion),
+                "cost": cost,
+                "timestamp": time.time(),
+            }
+            f.write(json.dumps(output) + "\n")
+            f.flush()
+            
+            logger.info(f"累计成本: ${total_cost:.5f}")
+            if max_cost and total_cost >= max_cost:
+                logger.warning(f"达到最大成本限制 ${max_cost}, 停止推理")
                 break
 
-
-def parse_model_args(model_args):
-    """
-    Parses a string of model arguments and returns a dictionary of keyword arguments.
-
-    Args:
-        model_args (str): A string of comma-separated key-value pairs representing model arguments.
-
-    Returns:
-        dict: A dictionary of keyword arguments parsed from the input string.
-    """
-    kwargs = dict()
-    if model_args is not None:
-        for arg in model_args.split(","):
-            key, value = arg.split("=")
-            # infer value type
-            if value in {"True", "False"}:
-                kwargs[key] = value == "True"
-            elif value.isnumeric():
+def parse_model_args(args_str):
+    """解析模型参数字符串"""
+    kwargs = {}
+    if not args_str:
+        return kwargs
+    
+    for pair in args_str.split(","):
+        key, value = pair.split("=", 1)
+        try:
+            # 自动类型转换
+            if value.lower() == "true":
+                kwargs[key] = True
+            elif value.lower() == "false":
+                kwargs[key] = False
+            elif value.isdigit():
                 kwargs[key] = int(value)
-            elif value.replace(".", "", 1).isnumeric():
+            elif value.replace('.', '', 1).isdigit():
                 kwargs[key] = float(value)
-            elif value in {"None"}:
-                kwargs[key] = None
-            elif value in {"[]"}:
-                kwargs[key] = []
-            elif value in {"{}"}:
-                kwargs[key] = {}
-            elif value.startswith("'") and value.endswith("'"):
-                kwargs[key] = value[1:-1]
-            elif value.startswith('"') and value.endswith('"'):
-                kwargs[key] = value[1:-1]
             else:
                 kwargs[key] = value
+        except:
+            kwargs[key] = value
     return kwargs
 
-
-def main(
-    dataset_name_or_path,
-    split,
-    model_name_or_path,
-    shard_id,
-    num_shards,
-    output_dir,
-    model_args,
-    max_cost,
-):
-    if shard_id is None and num_shards is not None:
-        logger.warning(
-            f"Received num_shards={num_shards} but shard_id is None, ignoring"
-        )
-    if shard_id is not None and num_shards is None:
-        logger.warning(f"Received shard_id={shard_id} but num_shards is None, ignoring")
-    model_args = parse_model_args(model_args)
-    model_nickname = model_name_or_path
-    if "checkpoint" in Path(model_name_or_path).name:
-        model_nickname = Path(model_name_or_path).parent.name
+def main(args):
+    """主流程"""
+    # 输出文件处理
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 数据集加载
+    if Path(args.dataset_name_or_path).exists():
+        dataset = load_from_disk(args.dataset_name_or_path)
     else:
-        model_nickname = Path(model_name_or_path).name
-    output_file = f"{model_nickname}__{dataset_name_or_path.split('/')[-1]}__{split}"
-    if shard_id is not None and num_shards is not None:
-        output_file += f"__shard-{shard_id}__num_shards-{num_shards}"
-    output_file = Path(output_dir, output_file + ".jsonl")
-    logger.info(f"Will write to {output_file}")
+        dataset = load_dataset(args.dataset_name_or_path)
+    
+    # 过滤已处理实例
     existing_ids = set()
-    if os.path.exists(output_file):
+    output_file = output_dir / f"{args.model_name_or_path}_results.jsonl"
+    if output_file.exists():
         with open(output_file) as f:
             for line in f:
                 data = json.loads(line)
-                instance_id = data["instance_id"]
-                existing_ids.add(instance_id)
-    logger.info(f"Read {len(existing_ids)} already completed ids from {output_file}")
-    if Path(dataset_name_or_path).exists():
-        dataset = load_from_disk(dataset_name_or_path)
+                existing_ids.add(data["instance_id"])
+    
+    # 排序处理
+    dataset = dataset[args.split]
+    indices = np.argsort([len(x) for x in dataset["text"]])
+    dataset = dataset.select(indices)
+    
+    # 分片处理
+    if args.shard_id is not None and args.num_shards:
+        dataset = dataset.shard(args.num_shards, args.shard_id)
+    
+    # 选择推理引擎
+    if "claude" in args.model_name_or_path.lower():
+        anthropic_inference(...)
     else:
-        dataset = load_dataset(dataset_name_or_path)
-    if split not in dataset:
-        raise ValueError(f"Invalid split {split} for dataset {dataset_name_or_path}")
-    dataset = dataset[split]
-    lens = np.array(list(map(len, dataset["text"])))
-    dataset = dataset.select(np.argsort(lens))
-    if len(existing_ids) > 0:
-        dataset = dataset.filter(
-            lambda x: x["instance_id"] not in existing_ids,
-            desc="Filtering out existing ids",
-            load_from_cache_file=False,
+        openai_inference(
+            test_dataset=dataset,
+            model_name=args.model_name_or_path,
+            output_file=output_file,
+            model_args=parse_model_args(args.model_args),
+            existing_ids=existing_ids,
+            max_cost=args.max_cost,
         )
-    if shard_id is not None and num_shards is not None:
-        dataset = dataset.shard(num_shards, shard_id, contiguous=True)
-    inference_args = {
-        "test_dataset": dataset,
-        "model_name_or_path": model_name_or_path,
-        "output_file": output_file,
-        "model_args": model_args,
-        "existing_ids": existing_ids,
-        "max_cost": max_cost,
-    }
-    if model_name_or_path.startswith("claude"):
-        anthropic_inference(**inference_args)
-    elif model_name_or_path.startswith("gpt"):
-        openai_inference(**inference_args)
-    else:
-        raise ValueError(f"Invalid model name or path {model_name_or_path}")
-    logger.info("Done!")
-
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description=__doc__)
+    parser = ArgumentParser()
     parser.add_argument(
         "--dataset_name_or_path",
         type=str,
@@ -560,4 +481,10 @@ if __name__ == "__main__":
         help="Maximum cost to spend on inference.",
     )
     args = parser.parse_args()
-    main(**vars(args))
+    
+    try:
+        main(args)
+    except Exception as e:
+        logger.error(f"主流程异常: {str(e)}")
+        traceback.print_exc()
+        exit(1)
